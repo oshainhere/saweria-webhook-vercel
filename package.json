@@ -1,0 +1,13 @@
+{
+  "name": "saweria-webhook-vercel",
+  "version": "1.0.0",
+  "description": "Saweria webhook server untuk Roblox (Vercel Serverless)",
+  "main": "api/webhook.js",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": "18.x"
+  }
+}
