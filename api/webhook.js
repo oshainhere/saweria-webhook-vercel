@@ -1,19 +1,21 @@
 const crypto = require("crypto");
 
-// Memory storage (gunakan DB jika ingin permanen)
+// Memory storage
 let donations = [];
 let topDonators = {};
 
-// Logging helper
+// LOG
 function log(msg, data = "") {
   console.log(`[${new Date().toISOString()}] ${msg}`, data);
 }
 
-// -----------------------------
-// SIGNATURE VERIFICATION
-// -----------------------------
-function verifySignature(body, receivedSig, secret) {
+// -------------------------------------
+// SIGNATURE VALIDATION (RAW BODY)
+// -------------------------------------
+function verifySignature(rawBody, receivedSig, secret) {
   try {
+    const body = JSON.parse(rawBody);
+
     const {
       version = "",
       id = "",
@@ -22,7 +24,6 @@ function verifySignature(body, receivedSig, secret) {
       donator_email = ""
     } = body;
 
-    // Order must match Saweria documentation
     const msg = `${version}${id}${amount_raw}${donator_name}${donator_email}`;
 
     const computed = crypto
@@ -32,6 +33,7 @@ function verifySignature(body, receivedSig, secret) {
 
     return computed === receivedSig;
   } catch (err) {
+    console.error("Signature error:", err);
     return false;
   }
 }
@@ -40,134 +42,85 @@ module.exports = async (req, res) => {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Saweria-Callback-Signature");
 
   if (req.method === "OPTIONS") return res.status(200).end();
 
   const path = req.url.split("?")[0];
-  const method = req.method;
 
-  // ---------------------------------------------------
-  // 🔥 WEBHOOK ENDPOINT (Saweria → Vercel)
-  // ---------------------------------------------------
-  if (method === "POST" && path === "/api/webhook") {
+  // -------------------------------------
+  // READ RAW BODY (WAJIB UNTUK SAWERIA)
+  // -------------------------------------
+  let rawBody = "";
+
+  await new Promise((resolve) => {
+    req.on("data", (chunk) => (rawBody += chunk));
+    req.on("end", resolve);
+  });
+
+  // -------------------------------------
+  // WEBHOOK ENDPOINT
+  // Saweria → Vercel
+  // -------------------------------------
+  if (req.method === "POST" && path === "/api/webhook") {
+    log("📨 Webhook received");
+
     const STREAM_KEY = process.env.SAWERIA_STREAMING_KEY || "";
     const signature = req.headers["saweria-callback-signature"];
 
-    log("📨 Webhook received");
+    if (!rawBody || rawBody.length < 10) {
+      log("❌ EMPTY BODY RECEIVED");
+      return res.status(400).json({ error: "Empty body" });
+    }
 
-    // Verify signature
-    if (STREAM_KEY !== "") {
-      const valid = verifySignature(req.body, signature, STREAM_KEY);
+    // Signature check
+    if (STREAM_KEY) {
+      const valid = verifySignature(rawBody, signature, STREAM_KEY);
 
       if (!valid) {
         log("❌ Invalid signature");
-        return res
-          .status(401)
-          .json({ success: false, error: "Invalid signature" });
+        return res.status(401).json({ success: false, error: "Invalid signature" });
       }
 
       log("✅ Signature verified");
     }
 
-    // Format donation
+    const body = JSON.parse(rawBody);
+
     const donation = {
-      id: req.body.id || "donation-" + Date.now(),
-      donor_name: req.body.donator_name || "Anonymous",
-      amount: req.body.amount_raw || req.body.amount || 0,
-      message: req.body.message || "",
-      timestamp: new Date().toISOString(),
-      created_at: req.body.created_at || new Date().toISOString()
+      id: body.id,
+      donor_name: body.donator_name,
+      amount: body.amount_raw,
+      message: body.message,
+      created_at: body.created_at,
+      timestamp: new Date().toISOString()
     };
 
-    // Save donation
     donations.push(donation);
 
-    // Track top donators
     topDonators[donation.donor_name] =
       (topDonators[donation.donor_name] || 0) + donation.amount;
-
-    // Limit memory
-    if (donations.length > 100) donations = donations.slice(-100);
 
     log("💰 Donation saved:", donation);
 
     return res.status(200).json({
       success: true,
-      message: "Donation received",
       donation
     });
   }
 
-  // ---------------------------------------------------
-  // GET: latest donations
-  // ---------------------------------------------------
-  if (method === "GET" && path === "/api/latest-donations") {
+  // OTHER ROUTES
+  if (req.method === "GET" && path === "/api/latest-donations") {
     const latest = donations.slice(-10).reverse();
-
-    return res.status(200).json({
-      success: true,
-      donations: latest,
-      count: latest.length
-    });
+    return res.status(200).json(latest);
   }
 
-  // ---------------------------------------------------
-  // GET: top donators
-  // ---------------------------------------------------
-  if (method === "GET" && path === "/api/top-donators") {
+  if (req.method === "GET" && path === "/api/top-donators") {
     const list = Object.entries(topDonators)
-      .map(([username, amount]) => ({ username, amount }))
-      .sort((a, b) => b.amount - a.amount)
-      .slice(0, 20);
-
-    return res.status(200).json({
-      success: true,
-      donators: list,
-      count: list.length
-    });
+      .map(([name, amount]) => ({ name, amount }))
+      .sort((a, b) => b.amount - a.amount);
+    return res.status(200).json(list);
   }
 
-  // ---------------------------------------------------
-  // POST: test donation
-  // ---------------------------------------------------
-  if (method === "POST" && path === "/api/test-donation") {
-    const d = {
-      id: "test-" + Date.now(),
-      donor_name: req.body.donor_name || "TestUser",
-      amount: req.body.amount || Math.floor(Math.random() * 50000) + 5000,
-      message: "Test donation",
-      timestamp: new Date().toISOString()
-    };
-
-    donations.push(d);
-
-    topDonators[d.donor_name] =
-      (topDonators[d.donor_name] || 0) + d.amount;
-
-    return res.status(200).json({ success: true, donation: d });
-  }
-
-  // ---------------------------------------------------
-  // CLEAR DATA
-  // ---------------------------------------------------
-  if (method === "POST" && path === "/api/clear-data") {
-    donations = [];
-    topDonators = {};
-
-    return res.status(200).json({ success: true, message: "Cleared" });
-  }
-
-  // ---------------------------------------------------
-  // HEALTH CHECK
-  // ---------------------------------------------------
-  if (method === "GET" && path === "/api/health") {
-    return res.status(200).json({
-      healthy: true,
-      timestamp: new Date().toISOString()
-    });
-  }
-
-  // Fallback
-  return res.status(404).json({ success: false, error: "Not found" });
+  res.status(404).json({ error: "Not found" });
 };
